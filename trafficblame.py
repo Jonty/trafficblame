@@ -1,58 +1,69 @@
-# TODO
-# * Extract mac/ip at offset but don't decode due to cpu-expensiveness
-# ** Decode at render time and cache
-# * Save mac with hostname data and re-lookup if it changes
-# * Configure options from command line
-# * Deuglify code
-# * Requirements.txt
-# * Query param for period
-# * Nicer template output
-# * Json output
-
+#!/usr/bin/env python
 import os
 import signal
 import socket
 import time
+import struct
+import ConfigParser
 from collections import defaultdict
 
 from pcapy import open_live
-from impacket import ImpactDecoder
+
 from netaddr import all_matching_cidrs
 
 from twisted.internet import reactor, task
 from twisted.web.wsgi import WSGIResource
 from twisted.web.server import Site
 
-from flask import Flask, Response#, render_template
+from flask import Flask, Response
 
-PERIOD = 30
-CIDR_RANGES = ['172.31.24.0/24']
-STRIPHOST = '.dhcp.lan.london.hackspace.org.uk'
+config = ConfigParser.ConfigParser()
+config.read(['trafficblame.conf'])
 
-DEV          = 'en0'    # Network interface
-MAX_LEN      = 1514     # Max packet size to capture
-PROMISCUOUS  = 1        # Get everything we can recv
-READ_TIMEOUT = 100      # In millis
-PCAP_FILTER  = ''       # Empty == Recv all packets
-MAX_PKTS     = -1       # Num packets to capture. -1 == No no, no no no no, no no no no, no no there's no limit.
+DEV = config.get('Network', 'SniffInterface')
+CIDR_RANGE = config.get('Network', 'CidrRange')
+PERIOD = config.get('Network', 'SamplePeriod')
 
+LISTEN_PORT = config.get('WebInterface', 'HttpPort')
+STRIPHOST = config.get('WebInterface', 'StripHost')
+
+
+current_data_received = defaultdict(int)
+current_data_sent = defaultdict(int)
+now = int(time.time())
 
 def run_pcap(f):
     def recv_packet(hdr, data):
-        decoder = ImpactDecoder.EthDecoder()
-        ether = decoder.decode(data)
-        ip_header = ether.child()
+        global now, current_data_received, current_data_sent
 
-        try:
-            src_ip = ip_header.get_ip_src()
-            dst_ip = ip_header.get_ip_dst()
-            reactor.callFromThread(f, src_ip, dst_ip, len(data))
+        # Fire off the aggregates to the main thread once per second.
+        # This is both because we work on second resolution, and because
+        # firing this for every packet is VERY expensive in Twisted
+        if int(time.time()) != now:
+            reactor.callFromThread(f, now, current_data_received, current_data_sent)
 
-        except AttributeError:
-            # Loopback packets missing IPs
-            # FIXME: Should avoid ever getting here with a better pcap filter
-            return
-         
+            current_data_received = defaultdict(int)
+            current_data_sent = defaultdict(int)
+            now = int(time.time())
+
+        #src_mac = data[0:6]
+        #dst_mac = data[6:12]
+        src_ip = data[26:30]
+        dst_ip = data[30:34]
+        data_len = hdr.getlen()
+        
+        current_data_received[dst_ip] += data_len
+        current_data_sent[src_ip] += data_len
+
+    # IP traffic that is leaving or arriving in the specified network, and not staying within it
+    PCAP_FILTER  = 'ip and ((src net %s and not dst net %s) or (dst net %s and src net not %s))' \
+        % (CIDR_RANGE * 4)
+    
+    MAX_LEN      = 35 # We only need the first 35 bytes of a packet
+    MAX_PKTS     = -1 # -1 == No limit
+    PROMISCUOUS  = 0
+    READ_TIMEOUT = 100 
+
     p = open_live(DEV, MAX_LEN, PROMISCUOUS, READ_TIMEOUT)
     p.setfilter(PCAP_FILTER)
     p.loop(MAX_PKTS, recv_packet)
@@ -76,11 +87,8 @@ def remove_old_data():
     return PERIOD
 
 
-hostname_cache = dict()
-
+hostname_cache = {}
 def populate_hostname_cache(ip):
-    print "MISS CACHE for %s" % ip
-    
     try:
         host = socket.gethostbyaddr(ip)[0]
     except socket.herror:
@@ -90,80 +98,92 @@ def populate_hostname_cache(ip):
         host = ip
 
     host = host.replace(STRIPHOST, '')
-
     hostname_cache[ip] = host
 
 
-def pcapDataReceived(src_ip, dst_ip, data_len):
-    # Ignore broadcast
-    if dst_ip in ('255.255.255.255'):
-        return
-
-    # Ignore multicast
-    if all_matching_cidrs(dst_ip, ['224.0.0.0/24']):
-        return
-
-    now = int(time.time())
-
-    src_match = all_matching_cidrs(src_ip, CIDR_RANGES)
-    dst_match = all_matching_cidrs(dst_ip, CIDR_RANGES)
-
+def process_packet_data(now, current_data_received, current_data_sent):
     matched_ips = []
+    datasets = [
+        (current_data_received, data_received),
+        (current_data_sent, data_sent)
+    ]
 
-    # We only want to monitor traffic leaving our network ranges
-    if src_match and not dst_match:
-        data_sent[now][src_ip] += data_len
-        matched_ips.append(src_ip)
-    
-    if dst_match and not src_match:
-        data_received[now][dst_ip] += data_len
-        matched_ips.append(dst_ip)
+    for new_data, data in datasets:
+        for bin_ip, data_len in new_data.items():
+            ip, = struct.unpack('!4s', bin_ip)
+            ip = socket.inet_ntoa(ip)
+
+            if all_matching_cidrs(ip, [CIDR_RANGE]):
+                data[now][ip] += data_len
+                matched_ips.append(ip)
  
     # Populate hostname cache
     for ip in matched_ips:
         if ip not in hostname_cache:
             hostname_cache[ip] = ip
             reactor.callInThread(populate_hostname_cache, ip)
+
  
+def format_amount(amount, seconds):
+    amount = amount / seconds
+    for x in ['b/s','kb/s','mb/s']:
+        if amount < 1000.0:
+            return "%3.1f %s" % (amount, x)
+        amount /= 1000.0
+
 
 app = Flask(__name__)
 @app.route("/")
 def serve_stats():
 
     sum_overall = defaultdict(int)
-    sum_recieved = defaultdict(int)
+    sum_received = defaultdict(int)
     sum_sent = defaultdict(int)
 
+    seconds_of_data = 0
     now = int(time.time())
+
     for timestamp in range(now, now - PERIOD, -1):
-        ips = data_received.get(timestamp, dict())
+        have_data = False
+
+        ips = data_received.get(timestamp, {})
         for ip, data_len in ips.items():
-            sum_recieved[ip] += data_len
+            sum_received[ip] += data_len
             sum_overall[ip] += data_len
+            have_data = True
         
-        ips = data_sent.get(timestamp, dict())
+        ips = data_sent.get(timestamp, {})
         for ip, data_len in ips.items():
             sum_sent[ip] += data_len
             sum_overall[ip] += data_len
+            have_data = True
 
+        if have_data:
+            seconds_of_data += 1
 
     totals = sorted(sum_overall.items(), lambda x,y: cmp(x[1], y[1]))
     totals.reverse()
 
-    format_string = '{0:<30}{1:<10}{2:<10}{3:<10}\n'
-    response = format_string.format('HOST', 'IN', 'OUT', 'TOTAL')
+    format_string = '{0:<20}{1:<35}{2:<14}{3:<13}{4:<13}\n'
+    response = format_string.format('IP', 'HOST', 'IN', 'OUT', 'TOTAL')
     response += '\n'
 
     for ip, total in totals:
-        response += format_string.format(hostname_cache[ip], sum_recieved[ip], sum_sent[ip], total)
+        response += format_string.format(
+            ip, hostname_cache[ip],
+            format_amount(sum_received[ip], seconds_of_data),
+            format_amount(sum_sent[ip], seconds_of_data),
+            format_amount(total, seconds_of_data)
+        )
 
-    headers = dict()
-    headers['Content-Type'] = 'text/plain'
-
+    headers = {
+        'Content-Type': 'text/plain'
+    }
     return Response(response, headers=headers)
 
 
 def main():
+
     # Register signal handlers to allow us to shut down the twisted event loop
     def die(x, y):
         print "Exiting"
@@ -174,15 +194,16 @@ def main():
 
     resource = WSGIResource(reactor, reactor.getThreadPool(), app)
     site = Site(resource)
+    reactor.listenTCP(LISTEN_PORT, site)
+    print "Server running on http://0.0.0.0:%s" % LISTEN_PORT
     
     clean_call = task.LoopingCall(remove_old_data)
     clean_call.start(1)
 
-    reactor.listenTCP(8080, site)
-
-    reactor.callInThread(run_pcap, pcapDataReceived)
+    reactor.callInThread(run_pcap, process_packet_data)
 
     reactor.run(installSignalHandlers=False)
  
+
 if __name__ == "__main__":
     main()

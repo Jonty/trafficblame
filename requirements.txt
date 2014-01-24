@@ -1,5 +1,4 @@
 Twisted==12.0.0
 Flask==0.9
 netaddr==0.7.10
-#Impacket==0.9.6.0
-#pcapy==0.10.5
+#pcapy - install from your OS packages
