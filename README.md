@@ -4,6 +4,8 @@ A thing to run on your linux-based router so people can see who is hogging the i
 # Demo time!
 Right now it exposes a text-tastic web interface giving details of devices currently active.
 
+    jonty@babbage:~$ curl http://172.31.24.1:8080
+    
     IP                  HOST                               IN            OUT          TOTAL        
 
     172.31.24.5         babbage                            1.5 kb/s      29.6 kb/s    31.1 kb/s    
