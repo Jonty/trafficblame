@@ -22,9 +22,9 @@ config.read(['trafficblame.conf'])
 
 DEV = config.get('Network', 'SniffInterface')
 CIDR_RANGE = config.get('Network', 'CidrRange')
-PERIOD = config.get('Network', 'SamplePeriod')
+PERIOD = int(config.get('Network', 'SamplePeriod'))
 
-LISTEN_PORT = config.get('WebInterface', 'HttpPort')
+LISTEN_PORT = int(config.get('WebInterface', 'HttpPort'))
 STRIPHOST = config.get('WebInterface', 'StripHost')
 
 
@@ -57,7 +57,7 @@ def run_pcap(f):
 
     # IP traffic that is leaving or arriving in the specified network, and not staying within it
     PCAP_FILTER  = 'ip and ((src net %s and not dst net %s) or (dst net %s and src net not %s))' \
-        % (CIDR_RANGE * 4)
+        % tuple([CIDR_RANGE] * 4)
     
     MAX_LEN      = 35 # We only need the first 35 bytes of a packet
     MAX_PKTS     = -1 # -1 == No limit
