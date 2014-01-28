@@ -126,7 +126,7 @@ def process_packet_data(now, current_data_received, current_data_sent):
  
 def format_amount(amount, seconds):
     amount = amount / seconds
-    for x in ['b/s','kb/s','mb/s']:
+    for x in ['b/s','kb/s','Mb/s']:
         if amount < 1000.0:
             return "%3.1f %s" % (amount, x)
         amount /= 1000.0
