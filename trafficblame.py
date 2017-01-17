@@ -71,8 +71,10 @@ def run_pcap(f):
 
 data_received = defaultdict(lambda: defaultdict(int))
 data_sent = defaultdict(lambda: defaultdict(int))
+hostname_cache = {}
 
 def remove_old_data():
+    # Remove data outside the window
     now = int(time.time())
     timerange = set(range(now, now - (PERIOD+1), -1))
     
@@ -84,10 +86,19 @@ def remove_old_data():
     for timestamp in old_sent_timestamps:
         del data_sent[timestamp]
 
+    # Remove inactive IP's from the hostname cache
+    live_ips = set()
+    for _, data in data_received.items():
+        live_ips.update(data.keys())
+    for _, data in data_sent.items():
+        live_ips.update(data.keys())
+
+    for ip in (set(hostname_cache.keys()) - live_ips):
+        del hostname_cache[ip]
+
     return PERIOD
 
 
-hostname_cache = {}
 def populate_hostname_cache(ip):
     try:
         host = socket.gethostbyaddr(ip)[0]
